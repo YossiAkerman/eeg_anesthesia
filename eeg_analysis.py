@@ -1,8 +1,27 @@
-"""Load and inspect the EEG recordings.
+"""EEG research project: loading, missing-data handling, and filtering.
 
-Each CSV in the data folder is one full recording. The file name gives the
-subject and the condition. Files named "surgery" are the first incision,
-stored here as Cut.
+PROJECT MAP
+-----------
+Step 1 - Data loading and inspection
+    recording_name()           : Read subject and condition from a filename.
+    load_recordings()          : Load all EEG CSV files into one dataset.
+    recording_summary()       : Summarize length, channels, and missing values.
+    missing_percent_by_channel(): Measure missingness for each EEG channel.
+    plot_missing_percentages(): Show missingness as a heatmap.
+
+Step 2 - Missing-data gap classification
+    classify_missing_gaps()   : Find consecutive NaN runs and group by size.
+
+Step 3 - Missing-data imputation
+    impute_recording()        : Fill eligible gaps using linear/PCHIP methods.
+    plot_imputation_example() : Compare original and filled samples.
+
+Step 4 - Band-pass filtering
+    bandpass_recording()      : Attenuate frequencies outside 1-40 Hz.
+
+All functions are called from EEG_Research.ipynb. Original CSVs must be
+preserved. The notes in this file explain the existing implementation;
+they do not change its numerical behavior or validate imputed samples.
 """
 
 from pathlib import Path
@@ -13,15 +32,26 @@ import pandas as pd
 from scipy.interpolate import PchipInterpolator
 from scipy.signal import butter, sosfiltfilt
 
+# region PROJECT SETTINGS
+# EEG sampling frequency: 500 samples per second, so one sample is 2 ms.
 SAMPLING_RATE_HZ = 500
+# Display conditions in the same sequence throughout the study.
 CONDITION_ORDER = {"Baseline": 0, "IFT": 1, "Cut": 2}
 
 # Gap-length cutoffs for this project, not values taken from the papers.
 # At 500 Hz, 50 samples is 100 ms and 250 samples is 500 ms.
 GAP_SHORT_MAX = 50
 GAP_MEDIUM_MAX = 250
+# endregion
 
 
+# region STEP 1 - LOAD AND INSPECT EEG RECORDINGS
+# Step 1A - File identification and data loading
+
+# WHAT: Extract the subject ID and recording stage from a CSV filename.
+# WHY: Later analyses need consistent labels such as "014" and "Baseline".
+# INPUT: A filename, e.g. "014_baseline (1).csv".
+# OUTPUT: A pair (subject_id, condition), e.g. ("014", "Baseline").
 def recording_name(filename):
     """Read the subject and condition from a CSV file name.
 
@@ -55,6 +85,12 @@ def recording_name(filename):
     return subject_id, condition
 
 
+
+# WHAT: Read every CSV in the data folder and identify EEG columns (Ch1, Ch2, ...).
+# WHY: All later analysis steps should use the same organized dataset.
+# INPUT: The data directory and EEG sampling frequency.
+# OUTPUT: A dictionary containing the sampling rate and all recordings;
+#         original NaN values and non-EEG metadata columns are preserved.
 def load_recordings(data_dir="data", sampling_rate_hz=SAMPLING_RATE_HZ):
     """Read every EEG CSV in the data folder.
 
@@ -71,6 +107,7 @@ def load_recordings(data_dir="data", sampling_rate_hz=SAMPLING_RATE_HZ):
     if not data_path.is_dir():
         raise FileNotFoundError(f"Data folder not found: {data_path}")
 
+    # Search only for CSV files and keep the order reproducible.
     csv_paths = sorted(data_path.glob("*.csv"))
     if not csv_paths:
         raise FileNotFoundError(f"No CSV files found in {data_path}")
@@ -96,6 +133,7 @@ def load_recordings(data_dir="data", sampling_rate_hz=SAMPLING_RATE_HZ):
         if not channel_names:
             raise ValueError(f"No EEG channel columns found in {path.name}")
 
+# Work on a copy of EEG columns, keeping non-EEG columns separate.
         eeg = table[channel_names].copy()
         n_invalid = 0
         for column in eeg.columns:
@@ -125,6 +163,13 @@ def load_recordings(data_dir="data", sampling_rate_hz=SAMPLING_RATE_HZ):
     }
 
 
+# Step 1B - Descriptive quality checks
+
+# WHAT: Create one summary row for each EEG recording.
+# WHY: Check recording duration, channel availability, and overall missingness.
+# INPUT: The dataset returned by load_recordings().
+# OUTPUT: A pandas DataFrame with counts, percentages, and empty channels.
+# NOTE: Missing percentages include fully empty channels in the denominator.
 def recording_summary(dataset):
     """Build one row per recording.
 
@@ -150,6 +195,7 @@ def recording_summary(dataset):
         eeg = recording["eeg"]
         n_samples = len(eeg)
         n_channels = eeg.shape[1]
+# isna() marks NaN cells; the two sums count them across all channels.
         n_missing = int(eeg.isna().sum().sum())
         n_values = n_samples * n_channels
         empty_channels = [column for column in eeg.columns if eeg[column].isna().all()]
@@ -172,6 +218,11 @@ def recording_summary(dataset):
     return pd.DataFrame(rows)
 
 
+
+# WHAT: Calculate the percentage of NaN values for each EEG channel.
+# WHY: A recording's overall missing percentage can hide problematic channels.
+# INPUT: The loaded dataset.
+# OUTPUT: A table: rows are recordings, columns are channels, values are %.
 def missing_percent_by_channel(dataset):
     """Missing-value percentage for every recording and EEG channel.
 
@@ -205,6 +256,11 @@ def missing_percent_by_channel(dataset):
     return pd.DataFrame.from_dict(rows, orient="index", columns=channel_names)
 
 
+
+# WHAT: Display channel-by-channel missing percentages in a heatmap.
+# WHY: Colors make channels with many missing samples easy to identify.
+# INPUT: The loaded dataset.
+# OUTPUT: A Matplotlib figure (does not modify EEG data).
 def plot_missing_percentages(dataset):
     """Draw one heatmap of missing-value percentage by recording and channel.
 
@@ -247,9 +303,15 @@ def plot_missing_percentages(dataset):
     return fig
 
 
-# Finds each run of consecutive missing samples and labels the run by length.
-# Gap length decides which imputation method is reasonable later, and a complete channel is not the same as a short gap.
-# Returns the summary table, the detailed gap table, and one stacked bar chart.
+# endregion
+
+# region STEP 2 - CLASSIFY MISSING-DATA GAPS
+
+# WHAT: Locate each consecutive run of NaN samples and classify its length.
+# WHY: Short, medium, long, and fully missing segments need different handling.
+# INPUT: The loaded dataset (500 Hz sampling rate by default).
+# OUTPUT: (summary table, detailed gap table, stacked bar-chart figure).
+# NOTE: The 1/50/250-sample thresholds are our project choices, not paper rules.
 def classify_missing_gaps(dataset):
     sampling_rate_hz = dataset["sampling_rate_hz"]
     ordered = sorted(
@@ -278,6 +340,7 @@ def classify_missing_gaps(dataset):
                 continue
 
             # A change from present to missing starts a gap. The next change ends it.
+# Padding lets np.diff detect gaps at the very start or end of a recording.
             padded = np.concatenate(([False], missing, [False]))
             changes = np.diff(padded.astype(np.int8))
             starts = np.flatnonzero(changes == 1)
@@ -358,9 +421,16 @@ def classify_missing_gaps(dataset):
     return gap_summary, gap_details, fig
 
 
-# Fills single, short, and medium gaps in one recording and leaves the rest missing.
-# Long gaps and empty channels cannot be recovered from neighboring samples in that channel.
-# Returns a copy of the recording, a log of every gap, and one summary row.
+# endregion
+
+# region STEP 3 - RECONSTRUCT ELIGIBLE MISSING SAMPLES
+
+# WHAT: Estimate missing samples in one recording using linear or PCHIP interpolation.
+# WHY: Some short missing segments can be filled for exploratory analysis.
+# INPUT: EEG DataFrame plus that recording's gap rows from Step 2.
+# OUTPUT: (filled EEG copy, decision log, summary counts).
+# RULES: One sample -> linear; 2-250 -> PCHIP; >250 or entire channel -> NaN.
+# CAUTION: Medium-gap PCHIP is provisional; all imputation needs validation.
 def impute_recording(eeg, gaps):
     filled = eeg.copy()
     n_missing_original = int(eeg.isna().sum().sum())
@@ -405,6 +475,7 @@ def impute_recording(eeg, gaps):
         values = observed.copy()
         valid_index = np.flatnonzero(~np.isnan(observed))
         pchip = None
+# Build PCHIP using only observed samples; never use previously filled values.
         if len(valid_index) >= 2:
             pchip = PchipInterpolator(valid_index, observed[valid_index], extrapolate=False)
 
@@ -431,6 +502,7 @@ def impute_recording(eeg, gaps):
                 reason = "gap was not missing in the original signal"
             elif not has_both_sides:
                 reason = "no observed sample on both sides"
+# For one missing sample, estimate a value on the line between neighbors.
             elif category == "Single":
                 left = valid_index[valid_index < start][-1]
                 right = valid_index[valid_index > end][0]
@@ -441,6 +513,7 @@ def impute_recording(eeg, gaps):
                 n_linear += n_filled
                 action = "linear"
                 reason = "filled from the nearest observed samples"
+# PCHIP uses the shape of nearby observed values; medium gaps are provisional.
             elif category in ("Short", "Medium"):
                 estimated = np.asarray(pchip(positions), dtype=float)
                 if not np.all(np.isfinite(estimated)):
@@ -491,9 +564,12 @@ def impute_recording(eeg, gaps):
     return filled, pd.DataFrame(log_rows), summary
 
 
-# Draws the original signal and the filled samples around one short gap and one medium gap.
-# One example is enough to see what changed, without a separate plot for every channel.
-# Returns a figure with two panels. Medium-gap values are marked as provisional.
+
+# WHAT: Plot one short and one medium filled gap against the original signal.
+# WHY: Visually inspect where interpolation added values and how they join.
+# INPUT: Original EEG, imputed EEG, and imputation decision log.
+# OUTPUT: One Matplotlib figure with two example panels.
+# NOTE: A smooth-looking curve does not prove reconstruction accuracy.
 def plot_imputation_example(original, imputed, gap_log):
     short_rows = gap_log[gap_log["action"] == "pchip"]
     medium_rows = gap_log[gap_log["action"] == "provisional_pchip"]
@@ -549,10 +625,18 @@ def plot_imputation_example(original, imputed, gap_log):
     return fig
 
 
-# Keeps frequencies from 1 Hz to 40 Hz and attenuates slower drift and faster noise.
-# Each continuous run of real samples is filtered on its own, so a missing gap is not crossed.
-# Returns a new table and a count of segments that were filtered or left unchanged because they were too short.
+# endregion
+
+# region STEP 4 - FILTER EEG SIGNALS (1-40 HZ)
+
+# WHAT: Apply a Butterworth 1-40 Hz band-pass filter to finite EEG segments.
+# WHY: Reduce slow baseline drift and higher-frequency signal components.
+# INPUT: A recording (usually from Step 3) and sampling frequency.
+# OUTPUT: (new filtered EEG DataFrame, filtering/too-short segment counts).
+# NOTE: A filter attenuates outside-band frequencies; it does not delete samples.
+#       NaN gaps remain NaN, and filtering never crosses an unfilled gap.
 def bandpass_recording(eeg, sampling_rate_hz=SAMPLING_RATE_HZ):
+# Order-4 Butterworth design, stored as stable second-order sections.
     sos = butter(4, [1, 40], btype="bandpass", fs=sampling_rate_hz, output="sos")
     # Same pad length sosfiltfilt uses. A shorter run cannot be filtered without inventing edges.
     n_sections = sos.shape[0]
@@ -566,6 +650,7 @@ def bandpass_recording(eeg, sampling_rate_hz=SAMPLING_RATE_HZ):
     for channel in eeg.columns:
         values = eeg[channel].to_numpy(dtype=float)
         output = values.copy()
+# Find continuous valid runs: never apply filtfilt across an unfilled NaN gap.
         finite = np.isfinite(values)
         padded = np.concatenate(([False], finite, [False]))
         changes = np.diff(padded.astype(np.int8))
@@ -576,6 +661,7 @@ def bandpass_recording(eeg, sampling_rate_hz=SAMPLING_RATE_HZ):
             if len(segment) <= pad_length:
                 n_too_short += 1
                 continue
+# Forward/backward filtering removes phase delay within this valid run.
             output[start:end + 1] = sosfiltfilt(sos, segment)
             n_filtered += 1
         filtered[channel] = output
@@ -585,3 +671,5 @@ def bandpass_recording(eeg, sampling_rate_hz=SAMPLING_RATE_HZ):
         "n_segments_too_short": n_too_short,
     }
     return filtered, counts
+
+# endregion
