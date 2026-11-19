@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.interpolate import PchipInterpolator
+from scipy.signal import butter, sosfiltfilt
 
 SAMPLING_RATE_HZ = 500
 CONDITION_ORDER = {"Baseline": 0, "IFT": 1, "Cut": 2}
@@ -546,3 +547,41 @@ def plot_imputation_example(original, imputed, gap_log):
 
     fig.tight_layout()
     return fig
+
+
+# Keeps frequencies from 1 Hz to 40 Hz and attenuates slower drift and faster noise.
+# Each continuous run of real samples is filtered on its own, so a missing gap is not crossed.
+# Returns a new table and a count of segments that were filtered or left unchanged because they were too short.
+def bandpass_recording(eeg, sampling_rate_hz=SAMPLING_RATE_HZ):
+    sos = butter(4, [1, 40], btype="bandpass", fs=sampling_rate_hz, output="sos")
+    # Same pad length sosfiltfilt uses. A shorter run cannot be filtered without inventing edges.
+    n_sections = sos.shape[0]
+    pad_length = 3 * (
+        2 * n_sections + 1 - min(int(np.sum(sos[:, 2] == 0)), int(np.sum(sos[:, 5] == 0)))
+    )
+
+    filtered = eeg.copy()
+    n_filtered = 0
+    n_too_short = 0
+    for channel in eeg.columns:
+        values = eeg[channel].to_numpy(dtype=float)
+        output = values.copy()
+        finite = np.isfinite(values)
+        padded = np.concatenate(([False], finite, [False]))
+        changes = np.diff(padded.astype(np.int8))
+        starts = np.flatnonzero(changes == 1)
+        ends = np.flatnonzero(changes == -1) - 1
+        for start, end in zip(starts, ends):
+            segment = values[start:end + 1]
+            if len(segment) <= pad_length:
+                n_too_short += 1
+                continue
+            output[start:end + 1] = sosfiltfilt(sos, segment)
+            n_filtered += 1
+        filtered[channel] = output
+
+    counts = {
+        "n_segments_filtered": n_filtered,
+        "n_segments_too_short": n_too_short,
+    }
+    return filtered, counts
