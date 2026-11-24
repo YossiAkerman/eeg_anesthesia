@@ -1,28 +1,4 @@
-"""EEG research project: loading, missing-data handling, and filtering.
 
-PROJECT MAP
------------
-Step 1 - Data loading and inspection
-    recording_name()           : Read subject and condition from a filename.
-    load_recordings()          : Load all EEG CSV files into one dataset.
-    recording_summary()       : Summarize length, channels, and missing values.
-    missing_percent_by_channel(): Measure missingness for each EEG channel.
-    plot_missing_percentages(): Show missingness as a heatmap.
-
-Step 2 - Missing-data gap classification
-    classify_missing_gaps()   : Find consecutive NaN runs and group by size.
-
-Step 3 - Missing-data imputation
-    impute_recording()        : Fill eligible gaps using linear/PCHIP methods.
-    plot_imputation_example() : Compare original and filled samples.
-
-Step 4 - Band-pass filtering
-    bandpass_recording()      : Attenuate frequencies outside 1-40 Hz.
-
-All functions are called from EEG_Research.ipynb. Original CSVs must be
-preserved. The notes in this file explain the existing implementation;
-they do not change its numerical behavior or validate imputed samples.
-"""
 
 from pathlib import Path
 
@@ -30,7 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.interpolate import PchipInterpolator
-from scipy.signal import butter, sosfiltfilt
+from scipy.signal import butter, sosfiltfilt, welch
 
 # region PROJECT SETTINGS
 # EEG sampling frequency: 500 samples per second, so one sample is 2 ms.
@@ -671,5 +647,344 @@ def bandpass_recording(eeg, sampling_rate_hz=SAMPLING_RATE_HZ):
         "n_segments_too_short": n_too_short,
     }
     return filtered, counts
+
+# endregion
+
+
+# region STEP 5 - SIGNAL ANALYSIS
+# These 10-second settings are project choices. Change them here to rerun the metrics.
+EPOCH_SECONDS = 10
+MAX_IMPUTED_FRACTION = 0.05
+WELCH_NPERSEG = 1000
+# A boundary belongs to the higher band. Gamma keeps 40 Hz, which is the filter edge.
+FREQUENCY_BANDS = (
+    ("Delta", 1, 4),
+    ("Theta", 4, 8),
+    ("Alpha", 8, 13),
+    ("Beta", 13, 30),
+    ("Gamma", 30, 40),
+)
+FANO_Z_THRESHOLD = 2.0
+FANO_BIN_SECONDS = 0.008
+
+
+# PURPOSE: Decide which 10-second pieces of a recording can enter the metrics.
+# METHOD: Drop channels that are missing for the whole file. Cut non-overlapping
+#   10-second epochs only inside stretches where every remaining channel is finite.
+#   Stretches are not joined across a NaN gap. A channel may contain at most 5%
+#   imputed samples in that epoch. Imputed means NaN in the original file and
+#   finite after Step 3.
+# INPUT: The original recording, the Step 3 copy, the Step 4 copy, and labels.
+# OUTPUT: A report row and a list of accepted epochs. Each epoch is a table of
+#   filtered samples for the kept channels.
+# PARAMETERS: epoch_seconds=10 and max_imputed_fraction=0.05.
+# LIMITATIONS: A stretch shorter than 10 seconds cannot make an epoch, including
+#   the short unfiltered runs in 015 Cut. READY means every full block passed.
+#   PARTIAL means at least one block was dropped. NOT READY means none passed.
+def prepare_recording(
+    original,
+    imputed,
+    filtered,
+    subject_id,
+    condition,
+    sampling_rate_hz=SAMPLING_RATE_HZ,
+    epoch_seconds=EPOCH_SECONDS,
+    max_imputed_fraction=MAX_IMPUTED_FRACTION,
+):
+    n_samples = len(original)
+    epoch_length = int(epoch_seconds * sampling_rate_hz)
+    kept = [channel for channel in original.columns if original[channel].notna().any()]
+    excluded = [channel for channel in original.columns if channel not in kept]
+    n_cells = original.size
+    report = {
+        "subject_id": subject_id,
+        "condition": condition,
+        "duration_seconds": n_samples / sampling_rate_hz,
+        "channels_used": ", ".join(kept),
+        "channels_excluded": ", ".join(excluded) if excluded else "None",
+        "original_missing_percent": 100 * original.isna().sum().sum() / n_cells,
+        "imputed_percent": 100 * (original.isna() & imputed.notna()).sum().sum() / n_cells,
+        "remaining_missing_percent": 100 * filtered.isna().sum().sum() / filtered.size,
+        "n_usable_epochs": 0,
+        "n_excluded_epochs": 0,
+        "exclusion_reason": "None",
+        "status": "NOT READY",
+    }
+    if not kept or epoch_length < 1:
+        report["exclusion_reason"] = "No channel has any recorded samples"
+        report["n_excluded_epochs"] = n_samples // epoch_length if epoch_length else 0
+        return report, []
+
+    imputed_flags = {
+        channel: (original[channel].isna() & imputed[channel].notna()).to_numpy()
+        for channel in kept
+    }
+    joint = np.isfinite(filtered[kept].to_numpy(dtype=float)).all(axis=1)
+    edges = np.diff(np.concatenate(([False], joint, [False])).astype(np.int8))
+    run_starts = np.flatnonzero(edges == 1)
+    run_ends = np.flatnonzero(edges == -1) - 1
+
+    epochs = []
+    n_short_runs = 0
+    n_failed_epochs = 0
+    for start, end in zip(run_starts, run_ends):
+        if end - start + 1 < epoch_length:
+            n_short_runs += 1
+            continue
+        n_blocks = (end - start + 1) // epoch_length
+        for block in range(n_blocks):
+            first = start + block * epoch_length
+            last = first + epoch_length
+            too_imputed = [
+                channel
+                for channel in kept
+                if imputed_flags[channel][first:last].mean() > max_imputed_fraction
+            ]
+            if too_imputed:
+                n_failed_epochs += 1
+                continue
+            epochs.append({
+                "subject_id": subject_id,
+                "condition": condition,
+                "start_sample": int(first),
+                "data": filtered.iloc[first:last][kept].reset_index(drop=True),
+            })
+
+    reasons = []
+    if n_failed_epochs:
+        reasons.append(
+            f"{n_failed_epochs} epochs had more than {max_imputed_fraction:.0%} imputed samples in a channel"
+        )
+    if n_short_runs:
+        reasons.append(f"{n_short_runs} finite stretches were shorter than {epoch_seconds:g} seconds")
+    report["n_usable_epochs"] = len(epochs)
+    report["n_excluded_epochs"] = n_failed_epochs + n_short_runs
+    report["exclusion_reason"] = "; ".join(reasons) if reasons else "None"
+    if epochs and report["n_excluded_epochs"] == 0:
+        report["status"] = "READY"
+    elif epochs:
+        report["status"] = "PARTIAL"
+    return report, epochs
+
+
+# PURPOSE: Measure how much signal power sits in each EEG frequency band.
+# METHOD: Welch's method on every channel and every accepted epoch. Absolute
+#   power is the area under that band. Relative power divides by the sum of
+#   the five band areas. Results stay at epoch level so the notebook can average them.
+# INPUT: Epochs from prepare_recording.
+# OUTPUT: band_power rows and the matching power spectra from 1 to 40 Hz.
+# PARAMETERS: fs=500, nperseg=1000 (0.5 Hz bins). Overlap is SciPy's default,
+#   half of nperseg. Bands are delta 1-4, theta 4-8, alpha 8-13, beta 13-30,
+#   gamma 30-40 Hz. A shared boundary goes to the higher band, and 40 Hz stays in gamma.
+# LIMITATIONS: This is power, not a consciousness score. The 1 Hz and 40 Hz
+#   filter edges still shape the spectrum.
+def welch_band_power(epochs, sampling_rate_hz=SAMPLING_RATE_HZ, nperseg=WELCH_NPERSEG):
+    band_rows = []
+    spectrum_rows = []
+    for epoch in epochs:
+        for channel in epoch["data"].columns:
+            values = epoch["data"][channel].to_numpy(dtype=float)
+            if not np.isfinite(values).all():
+                continue
+            frequencies, power = welch(values, fs=sampling_rate_hz, nperseg=nperseg)
+            in_range = (frequencies >= 1) & (frequencies <= 40)
+            for frequency, value in zip(frequencies[in_range], power[in_range]):
+                spectrum_rows.append({
+                    "subject_id": epoch["subject_id"],
+                    "condition": epoch["condition"],
+                    "start_sample": epoch["start_sample"],
+                    "channel": channel,
+                    "frequency": float(frequency),
+                    "power": float(value),
+                })
+            absolute = {}
+            for name, low, high in FREQUENCY_BANDS:
+                if name == "Gamma":
+                    selected = (frequencies >= low) & (frequencies <= high)
+                else:
+                    selected = (frequencies >= low) & (frequencies < high)
+                absolute[name] = float(np.trapezoid(power[selected], frequencies[selected]))
+            total = sum(absolute.values())
+            for name, value in absolute.items():
+                band_rows.append({
+                    "subject_id": epoch["subject_id"],
+                    "condition": epoch["condition"],
+                    "start_sample": epoch["start_sample"],
+                    "channel": channel,
+                    "band": name,
+                    "absolute_power": value,
+                    "relative_power": value / total if total > 0 else np.nan,
+                })
+    return pd.DataFrame(band_rows), pd.DataFrame(spectrum_rows)
+
+
+# PURPOSE: Estimate how steeply power falls as frequency rises.
+# METHOD: Average the Welch spectrum across epochs within each channel, then
+#   fit specparam in fixed aperiodic mode. The exponent is positive: a larger
+#   value is a steeper fall in log-log space. The same spectrum is fit on
+#   1-40 Hz, 1-20 Hz, and 20-40 Hz.
+# INPUT: The spectrum table returned by welch_band_power.
+# OUTPUT: One exponent per subject, condition, channel, and frequency range,
+#   plus the 1-40 Hz aperiodic curve used for the log-log figure.
+# PARAMETERS: specparam aperiodic_mode="fixed". Peak limits are only there so
+#   the aperiodic fit is not pulled toward a narrow peak.
+# LIMITATIONS: This is not a consciousness measure. The 1 Hz and 40 Hz filter
+#   edges can bend the fit. 20 Hz is included in both split ranges.
+def spectral_exponent(spectra):
+    from specparam import SpectralModel
+
+    empty_fit = pd.DataFrame(columns=[
+        "subject_id", "condition", "channel", "frequency_range", "exponent", "r_squared",
+    ])
+    empty_curve = pd.DataFrame(columns=[
+        "subject_id", "condition", "channel", "frequency", "mean_power", "aperiodic_power",
+    ])
+    if spectra.empty:
+        return empty_fit, empty_curve
+
+    averaged = (
+        spectra.groupby(["subject_id", "condition", "channel", "frequency"], as_index=False)["power"]
+        .mean()
+        .rename(columns={"power": "mean_power"})
+    )
+    fit_rows = []
+    curve_rows = []
+    ranges = (("1-40 Hz", 1, 40), ("1-20 Hz", 1, 20), ("20-40 Hz", 20, 40))
+    for (subject_id, condition, channel), channel_spectrum in averaged.groupby(
+        ["subject_id", "condition", "channel"]
+    ):
+        frequencies = channel_spectrum["frequency"].to_numpy(dtype=float)
+        power = channel_spectrum["mean_power"].to_numpy(dtype=float)
+        for label, low, high in ranges:
+            selected = (frequencies >= low) & (frequencies <= high)
+            exponent = np.nan
+            r_squared = np.nan
+            offset = np.nan
+            if selected.sum() >= 4 and np.all(power[selected] > 0):
+                model = SpectralModel(
+                    aperiodic_mode="fixed",
+                    verbose=False,
+                    peak_width_limits=[1, 6],
+                    min_peak_height=0.05,
+                    max_n_peaks=6,
+                )
+                try:
+                    model.fit(frequencies[selected], power[selected], freq_range=[low, high])
+                    if model.results.has_model:
+                        exponent = float(model.get_params("aperiodic", "exponent"))
+                        offset = float(model.get_params("aperiodic", "offset"))
+                        r_squared = float(model.to_df()["gof_rsquared"])
+                except Exception:
+                    exponent = np.nan
+            fit_rows.append({
+                "subject_id": subject_id,
+                "condition": condition,
+                "channel": channel,
+                "frequency_range": label,
+                "exponent": exponent,
+                "r_squared": r_squared,
+            })
+            if label == "1-40 Hz" and np.isfinite(exponent):
+                fitted = 10 ** (offset - exponent * np.log10(frequencies[selected]))
+                for frequency, observed, predicted in zip(frequencies[selected], power[selected], fitted):
+                    curve_rows.append({
+                        "subject_id": subject_id,
+                        "condition": condition,
+                        "channel": channel,
+                        "frequency": float(frequency),
+                        "mean_power": float(observed),
+                        "aperiodic_power": float(predicted),
+                    })
+    return pd.DataFrame(fit_rows), pd.DataFrame(curve_rows)
+
+
+# PURPOSE: Measure how regular or varied a channel is inside one epoch.
+# METHOD: Mark each sample above that epoch's own mean as 1 and the rest as 0,
+#   then compute normalized Lempel-Ziv complexity with antropy. Normalization
+#   divides by n / log2(n). Epoch values are returned separately so they can
+#   be averaged within a recording.
+# INPUT: Epochs from prepare_recording.
+# OUTPUT: One complexity value per subject, condition, epoch, and channel.
+# PARAMETERS: Binarization at the epoch mean. antropy normalize=True.
+# LIMITATIONS: This is not PCI and it is not a consciousness measure. The
+#   mean threshold is a project choice.
+def lempel_ziv_complexity(epochs):
+    from antropy import lziv_complexity
+
+    rows = []
+    for epoch in epochs:
+        for channel in epoch["data"].columns:
+            values = epoch["data"][channel].to_numpy(dtype=float)
+            if not np.isfinite(values).all():
+                continue
+            binary = (values > values.mean()).astype(int)
+            rows.append({
+                "subject_id": epoch["subject_id"],
+                "condition": epoch["condition"],
+                "start_sample": epoch["start_sample"],
+                "channel": channel,
+                "lzc": float(lziv_complexity(binary, normalize=True)),
+            })
+    return pd.DataFrame(rows)
+
+
+# PURPOSE: Describe how evenly large excursions are spread across an epoch.
+# METHOD: Z-score each channel inside the epoch. An event starts when the
+#   absolute z-score crosses 2; later samples in the same excursion are not
+#   counted again. Event starts are summed across channels in 8 ms bins.
+#   The Fano factor is the variance of those bin counts divided by their mean.
+# INPUT: Epochs from prepare_recording.
+# OUTPUT: One Fano factor per epoch, and the bin counts used to draw the trace.
+# PARAMETERS: threshold=2 standard deviations and bin_seconds=0.008 (4 samples
+#   at 500 Hz). Variance uses the population formula, divide by the number of bins.
+# LIMITATIONS: The absolute-value rule is this project's choice. It follows the
+#   idea of counting events in Maschke et al. (2024), and it is not the
+#   variance of the raw EEG. The result is NaN when an epoch has no events.
+def fano_factor(
+    epochs,
+    sampling_rate_hz=SAMPLING_RATE_HZ,
+    threshold=FANO_Z_THRESHOLD,
+    bin_seconds=FANO_BIN_SECONDS,
+):
+    bin_size = max(1, int(round(bin_seconds * sampling_rate_hz)))
+    summary_rows = []
+    count_rows = []
+    for epoch in epochs:
+        channels = [
+            epoch["data"][channel].to_numpy(dtype=float)
+            for channel in epoch["data"].columns
+            if np.isfinite(epoch["data"][channel].to_numpy(dtype=float)).all()
+        ]
+        if not channels:
+            continue
+        n_bins = len(channels[0]) // bin_size
+        counts = np.zeros(n_bins)
+        for values in channels:
+            centered = values - values.mean()
+            scale = centered.std()
+            if scale == 0:
+                continue
+            above = np.abs(centered / scale) >= threshold
+            starts = above.copy()
+            starts[1:] &= ~above[:-1]
+            counts += starts[:n_bins * bin_size].reshape(n_bins, bin_size).sum(axis=1)
+        mean_count = float(counts.mean())
+        factor = np.nan if mean_count == 0 else float(counts.var() / mean_count)
+        summary_rows.append({
+            "subject_id": epoch["subject_id"],
+            "condition": epoch["condition"],
+            "start_sample": epoch["start_sample"],
+            "mean_event_count": mean_count,
+            "fano_factor": factor,
+        })
+        for index, count in enumerate(counts):
+            count_rows.append({
+                "subject_id": epoch["subject_id"],
+                "condition": epoch["condition"],
+                "start_sample": epoch["start_sample"],
+                "time_seconds": index * bin_size / sampling_rate_hz,
+                "event_count": int(count),
+            })
+    return pd.DataFrame(summary_rows), pd.DataFrame(count_rows)
 
 # endregion
